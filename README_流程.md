@@ -43,8 +43,8 @@
 | 脚本 | 作用 | 状态 |
 |---|---|---|
 | `network_voronoi.py` | 75个仓多源Dijkstra，每个节点找最近仓，检测边界边 | ✅ 已完成 |
-| `three_scenarios.py` | 三仓场景对比：盒马单独/中百仓储单独/混合 | ✅ 已完成 |
-| `compare_methods.py` | 网络泰森多边形 vs 传统欧氏缓冲圆对比 | ✅ 已完成 |
+| `three_scenarios.py` | 三仓场景对比：盒马单独/中百仓储单独/罗森单独 | ✅ 已完成 |
+| `compare_methods.py` | 网络泰森多边形 vs 传统欧氏缓冲圆对比 |  未完成 |
 
 **输出**：facility_load.csv, boundary_edges.csv, node_assign.csv, three_scenario_compare.csv, network_vs_euclidean.csv
 
