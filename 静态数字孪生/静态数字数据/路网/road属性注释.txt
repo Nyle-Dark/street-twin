@@ -1,0 +1,11 @@
+`u`（起点路口）
+`v`（终点路口）
+`key`（平行边序号）
+`highway`（道路等级・OSM 英文）
+`oneway`（单双向）
+`length`（长度・米）
+`road_class`（道路等级・中文）
+`bridge`（桥梁）
+`tunnel`（隧道）
+`name`（路名）
+`maxspeed`（限速・km/h）

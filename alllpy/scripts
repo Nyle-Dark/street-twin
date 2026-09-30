@@ -1,0 +1,229 @@
+"""
+补充第二步：人口栅格融合
+1. 读 GHSL 100m 人口栅格
+2. 对每个 POI 采样人口值
+3. 需求当量 = 类别权重 × (1 + 0.5 × pop_factor)
+4. 重新分摊到节点
+5. 重新跑多源 Dijkstra
+"""
+import os
+import math
+import pandas as pd
+import numpy as np
+import networkx as nx
+import osmnx as ox
+import rasterio
+
+ROAD_DIR = r'C:\Users\temp\Desktop\静态数字孪生\静态数字数据\路网'
+POI_DIR = r'C:\Users\temp\Desktop\静态数字孪生\静态数字数据\POI'
+POP_TIF = r'C:\Users\temp\Desktop\静态数字孪生\静态数字数据\人口\wuhan_ghsl_pop_100m_2025.tif'
+
+# === 1. 读人口栅格 ===
+print("=== 1. 读人口栅格 ===")
+with rasterio.open(POP_TIF) as src:
+    pop_data = src.read(1)  # 第一波段
+    transform = src.transform
+    crs = src.crs
+    print(f"栅格形状: {pop_data.shape}")
+    print(f"坐标系: {crs}")
+    print(f"有效像元数: {(pop_data > 0).sum()}")
+    print(f"最大人口: {pop_data.max():.0f}")
+    pop_max = pop_data.max()
+
+def sample_pop(lon, lat):
+    """采样某经纬度的人口值"""
+    # 经纬度 → 栅格行列号
+    col, row = ~transform * (lon, lat)
+    row = int(row)
+    col = int(col)
+    if 0 <= row < pop_data.shape[0] and 0 <= col < pop_data.shape[1]:
+        return float(pop_data[row, col])
+    return 0.0
+
+# === 2. 加载已锚定的图 ===
+print("\n=== 2. 加载路网图 ===")
+G = ox.load_graphml(os.path.join(ROAD_DIR, 'wuhan_graph.graphml'))
+G.graph['crs'] = 'epsg:4326'
+
+# 修复类型
+for n in G.nodes:
+    G.nodes[n]['is_generator'] = False
+    G.nodes[n]['brand'] = ''
+    G.nodes[n]['demand_weight'] = 0.0
+for u, v, k, data in G.edges(keys=True, data=True):
+    data['impedance'] = float(data.get('impedance', 0))
+    data['length'] = float(data.get('length', 0))
+
+# === 3. 读所有 POI 并做坐标转换 ===
+print("\n=== 3. 读 POI + 坐标转换 ===")
+
+def gcj02_to_wgs84(lon, lat):
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    def _tlat(x, y):
+        r = -100 + 2*x + 3*y + 0.2*y*y + 0.1*x*y + 0.2*math.sqrt(abs(x))
+        r += (20*math.sin(6*x*math.pi) + 20*math.sin(2*x*math.pi)) * 2/3
+        r += (20*math.sin(y*math.pi) + 40*math.sin(y/3*math.pi)) * 2/3
+        r += (160*math.sin(y/12*math.pi) + 320*math.sin(y*math.pi/30)) * 2/3
+        return r
+    def _tlon(x, y):
+        r = 300 + x + 2*y + 0.1*x*x + 0.1*x*y + 0.1*math.sqrt(abs(x))
+        r += (20*math.sin(6*x*math.pi) + 20*math.sin(2*x*math.pi)) * 2/3
+        r += (20*math.sin(x*math.pi) + 40*math.sin(x/3*math.pi)) * 2/3
+        r += (150*math.sin(x/12*math.pi) + 300*math.sin(x/30*math.pi)) * 2/3
+        return r
+    dlat = _tlat(lon-105, lat-35)
+    dlon = _tlon(lon-105, lat-35)
+    radlat = lat/180*math.pi
+    magic = 1 - ee*math.sin(radlat)**2
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat*180) / ((a*(1-ee))/(magic*sqrtmagic)*math.pi)
+    dlon = (dlon*180) / (a/sqrtmagic*math.cos(radlat)*math.pi)
+    return lon*2-(lon+dlon), lat*2-(lat+dlat)
+
+BASE_WEIGHT = {
+    '住宅': 1.0, '写字楼': 0.8, '商圈': 1.5,
+    '交通枢纽': 0.5, '中百罗森': 0.5,
+}
+
+all_pois = []
+for fname, cat in [('POI_住宅.csv','住宅'), ('POI_写字楼.csv','写字楼'),
+                   ('POI_商圈.csv','商圈'), ('POI_交通枢纽.csv','交通枢纽')]:
+    df = pd.read_csv(os.path.join(POI_DIR, fname))
+    df['category'] = cat
+    all_pois.append(df)
+
+# 真实网点
+df = pd.read_csv(os.path.join(POI_DIR, 'POI_真实网点.csv'))
+hema = df[df['brand'] == '盒马鲜生'].copy()
+zb_cangchu = df[df['brand'] == '中百仓储'].copy()
+luosen = df[df['brand'] == '中百罗森'].copy()
+
+# 清洗
+hema = hema[~hema['name'].str.contains('烘焙|网络科技', na=False)]
+hema = hema[(hema['lon']>=114.17)&(hema['lon']<=114.56)&(hema['lat']>=30.46)&(hema['lat']<=30.68)]
+zb_cangchu = zb_cangchu[(zb_cangchu['lon']>=114.17)&(zb_cangchu['lon']<=114.56)&
+                        (zb_cangchu['lat']>=30.46)&(zb_cangchu['lat']<=30.68)]
+luosen['category'] = '中百罗森'
+all_pois.append(luosen)
+
+demand_pois = pd.concat(all_pois, ignore_index=True)
+
+# GCJ-02 → WGS-84
+conv = demand_pois.apply(lambda r: gcj02_to_wgs84(r['lon'], r['lat']), axis=1)
+demand_pois['lon'] = [c[0] for c in conv]
+demand_pois['lat'] = [c[1] for c in conv]
+
+# bbox 过滤（WGS-84 坐标）
+before = len(demand_pois)
+demand_pois = demand_pois[(demand_pois.lon>=114.17)&(demand_pois.lon<=114.56)&
+                          (demand_pois.lat>=30.46)&(demand_pois.lat<=30.68)]
+print(f"需求 POI: {len(demand_pois)}（bbox过滤掉 {before-len(demand_pois)} 个）")
+
+# === 4. 采样人口 + 算最终需求当量 ===
+print("\n=== 4. 采样人口 + 算需求当量 ===")
+demand_pois['pop'] = demand_pois.apply(lambda r: sample_pop(r['lon'], r['lat']), axis=1)
+demand_pois['pop'] = demand_pois['pop'].fillna(0)  # NaN 填 0
+demand_pois['base_weight'] = demand_pois['category'].map(BASE_WEIGHT)
+
+# pop_factor = log(1+pop) / log(1+pop_max)，归一化 0-1
+demand_pois['pop_factor'] = np.log1p(demand_pois['pop']) / np.log1p(pop_max)
+# 最终权重 = base × (1 + 0.5 × pop_factor)
+demand_pois['final_weight'] = demand_pois['base_weight'] * (1 + 0.5 * demand_pois['pop_factor'])
+
+print(f"人口采样: 有人口值的 POI {(demand_pois['pop']>0).sum()}/{len(demand_pois)}")
+print(f"pop_factor 范围: {demand_pois['pop_factor'].min():.3f} - {demand_pois['pop_factor'].max():.3f}")
+print(f"final_weight 范围: {demand_pois['final_weight'].min():.2f} - {demand_pois['final_weight'].max():.2f}")
+
+# === 5. 投影 + 分摊 ===
+print("\n=== 5. 投影 + 分摊 ===")
+MAX_WALK = 200
+lons = demand_pois['lon'].tolist()
+lats = demand_pois['lat'].tolist()
+nearest_edges, nearest_dists = ox.distance.nearest_edges(G, X=lons, Y=lats, return_dist=True)
+
+for i in range(len(nearest_edges)):
+    u, v, key = int(nearest_edges[i][0]), int(nearest_edges[i][1]), int(nearest_edges[i][2])
+    dist = float(nearest_dists[i])
+    if dist > MAX_WALK:
+        continue
+    w = demand_pois.iloc[i]['final_weight']
+    # 按到两端节点距离比例分摊
+    dx_u = demand_pois.iloc[i]['lon'] - G.nodes[u]['x']
+    dy_u = demand_pois.iloc[i]['lat'] - G.nodes[u]['y']
+    d_u = math.sqrt(dx_u**2 + dy_u**2) * 111000
+    dx_v = demand_pois.iloc[i]['lon'] - G.nodes[v]['x']
+    dy_v = demand_pois.iloc[i]['lat'] - G.nodes[v]['y']
+    d_v = math.sqrt(dx_v**2 + dy_v**2) * 111000
+    total = d_u + d_v
+    if total > 0:
+        G.nodes[u]['demand_weight'] += w * d_v / total
+        G.nodes[v]['demand_weight'] += w * d_u / total
+
+# === 6. 投影仓 ===
+print("\n=== 6. 投影仓 ===")
+for gdf in [hema, zb_cangchu]:
+    c = gdf.apply(lambda r: gcj02_to_wgs84(r['lon'], r['lat']), axis=1)
+    gdf['lon'] = [x[0] for x in c]
+    gdf['lat'] = [x[1] for x in c]
+
+gen_count = 0
+for brand, gdf in [('盒马鲜生', hema), ('中百仓储', zb_cangchu)]:
+    for _, row in gdf.iterrows():
+        nn = ox.distance.nearest_nodes(G, X=row['lon'], Y=row['lat'])
+        G.nodes[nn]['is_generator'] = True
+        G.nodes[nn]['brand'] = brand
+        gen_count += 1
+
+gen_nodes = [n for n in G.nodes if G.nodes[n]['is_generator']]
+print(f"仓: {gen_count} 个, generator 节点: {len(gen_nodes)}")
+
+# === 7. 多源 Dijkstra ===
+print("\n=== 7. 多源 Dijkstra ===")
+nearest_gen = {}
+min_dist = {}
+for gen in gen_nodes:
+    lengths = nx.single_source_dijkstra_path_length(G, gen, weight='impedance')
+    for node, d in lengths.items():
+        if node not in min_dist or d < min_dist[node]:
+            min_dist[node] = d
+            nearest_gen[node] = gen
+
+print(f"覆盖: {len(nearest_gen)}/{G.number_of_nodes()}")
+
+# === 8. 统计各仓负荷 ===
+print("\n=== 8. 各仓负荷 ===")
+from collections import defaultdict
+load = defaultdict(float)
+nodes_cov = defaultdict(int)
+maxd = defaultdict(float)
+for node in G.nodes:
+    if node in nearest_gen:
+        g = nearest_gen[node]
+        load[g] += G.nodes[node]['demand_weight']
+        nodes_cov[g] += 1
+        if min_dist[node] > maxd[g]:
+            maxd[g] = min_dist[node]
+
+results = []
+for g in sorted(load.keys(), key=lambda x: -load[x]):
+    results.append({
+        'node': g, 'brand': G.nodes[g]['brand'],
+        'nodes': nodes_cov[g], 'demand': round(load[g], 1),
+        'max_dist': round(maxd[g], 0),
+    })
+df_res = pd.DataFrame(results)
+print(df_res.head(15).to_string(index=False))
+print(f"\n总负荷: {sum(load.values()):.1f}")
+
+# === 9. 保存 ===
+print("\n=== 9. 保存 ===")
+df_res.to_csv(os.path.join(POI_DIR, 'facility_load_v2.csv'),
+              index=False, encoding='utf-8-sig')
+demand_pois[['name','category','lon','lat','pop','base_weight','final_weight']].to_csv(
+    os.path.join(POI_DIR, 'poi_with_pop.csv'), index=False, encoding='utf-8-sig')
+
+# 存更新后的图
+ox.save_graphml(G, os.path.join(ROAD_DIR, 'wuhan_graph_pop.graphml'))
+print("已存 facility_load_v2.csv, poi_with_pop.csv, wuhan_graph_pop.graphml")
+print("\n=== 完成 ===")
